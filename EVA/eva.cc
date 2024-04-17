@@ -3,6 +3,7 @@
 #include <map>
 #include <vector>
 #include <iostream>
+#include <random>
 #include <cstdint>
 #include <bitset>
 #include <tuple>
@@ -10,18 +11,19 @@
 
 namespace
 {
-const uint32_t k = 7; // Define the constant 2^k for age granularity
+const uint32_t k = 14; // Define the constant 2^k for age granularity
 const uint32_t size = 2 * (1 << (k + 1));
 const int NUM_SETS = 2048; // Number of sets in the cache
 const int NUM_WAYS = 16; // Number of ways (cache lines) per set
-const int AGE_BITS = 7; // Number of bits for age counter
+const int AGE_BITS = 14; // Number of bits for age counter
 const int TIMESTAMP_BITS = 7; // Number of bits for timestamp counter
 const int AGE_GRANULARITY = 15; // Age granularity (limit A)
 const int MAX_AGE_VALUE = 2 * (1 << (k + 1)); // Maximum value for age counter
 std::map<CACHE*, std::vector<uint64_t>> last_used_cycles;
-double hitCtrs_nn[NUM_SETS][MAX_AGE_VALUE][2] = {{0.0}};
-double evictionCtrs_nn[NUM_SETS][MAX_AGE_VALUE][2] = {{0.0}};
+double hitCtrs_nn[MAX_AGE_VALUE][2] = {{0.0}};
+double evictionCtrs_nn[MAX_AGE_VALUE][2] = {{0.0}};
 int evafg = 0;
+double ewmaDecay = 0.8;
 }
 
 // Cache line structure
@@ -113,79 +115,89 @@ public:
 };
 
 // Function to compute EVA and update ranks
-std::vector<double> computeEVAandUpdateRanks(double hitCtrs[][MAX_AGE_VALUE][2], double evictionCtrs[][MAX_AGE_VALUE][2], double A, double N) {
+std::vector<double> computeEVAandUpdateRanks(double hitCtrs[MAX_AGE_VALUE][2], double evictionCtrs[MAX_AGE_VALUE][2], double A, double N) {
     // Initialize variables
     std::vector<double> rank(2 * (1 << (k + 1)));
     std::vector<double> hR(2 * (1 << (k + 1)));
     std::vector<double> hNR(2 * (1 << (k + 1)));
-    std::vector<double> eventR(2 * (1 << (k + 1)));
-    std::vector<double> eventNR(2 * (1 << (k + 1)));
+    double hRsum = 0;
+    double hNRsum = 0;
+    double eventR = 0;
+    double eventNR = 0;
 
     // Compute hit rates from counters
-    for (int set = 0; set < NUM_SETS; set++) {
-        for (int age = 1; age <= MAX_AGE_VALUE; age++) {
-            for (int c = 0; c < 2; c++) { // 0 - NotReused; 1 - Reused
-                if (c == 0) {
-                    hNR[age] += hitCtrs[set][age][c];
-                    eventNR[age] += hitCtrs[set][age][c] + evictionCtrs[set][age][c];
-                } else {
-                    hR[age] += hitCtrs[set][age][c];
-                    eventR[age] += hitCtrs[set][age][c] + evictionCtrs[set][age][c];
-                }
+        for (int age = MAX_AGE_VALUE; age > 0; age--) {
+            hNRsum += hitCtrs[age][0];
+            eventNR += hitCtrs[age][0] + evictionCtrs[age][0];
+            hRsum += hitCtrs[age][1];
+            eventR += hitCtrs[age][1] + evictionCtrs[age][1];
+            hR[age] = hRsum/eventR;
+            hNR[age] = hNRsum/eventNR;
+        }
+
+    // Calculate overall hit rate
+    double h = (hRsum + hNRsum)/(eventR + eventNR);
+    // doible lineGain = 1. * (hRsum+hNRsum) / (eventR + eventNR) / MAX_AGE_VALUE;
+    // double events = 0;
+    // double lineGain = 0;
+   
+    // double event[MAX_AGE_VALUE] = {0.};
+    // double totalEventsAbove[MAX_AGE_VALUE] = {0.};
+    
+    // for (int age = 1; age <= MAX_AGE_VALUE-1; age++) {
+    //     event[age] = ewmaHits[age] + ewmaEvictions[age];
+    //     totalEventsAbove[age] = totalEventsAbove[age+1] + event[age];
+    //     lineGain += 1. * ewmaHits[age] / (ewmaHits[age] + ewmaEvictions[age]) / MAX_AGE_VALUE;
+    // }
+    // double lineGain = 1. * ewmaHits / (ewmaHits + ewmaEvictions) / MAX_AGE_VALUE;
+    double perAccessCost = h * A / (NUM_SETS*NUM_WAYS);
+
+    // Compute EVA
+    std::vector<std::vector<double>> eva(2, std::vector<double>(2 * (1 << (k + 1)), 0));
+
+    for (int c = 0; c < 2; c++) {
+         double expectedLifetime = 0; // Initialize expectedLifetime to 0
+         double hits = 0; // Initialize hits to 0
+         double events = 0; // Initialize events to 0
+        // double expectedLifetimeUnconditioned = 0;
+        for (int age = MAX_AGE_VALUE; age > 0; age--) {
+            expectedLifetime += events;
+            // expectedLifetimeUnconditioned = (age/2+0.5) * totalEventsAbove[age];
+            // expectedLifetime = ((1./6) * (age/2+0.5)* event[age] + expectedLifetimeUnconditioned) / (0.5 * event[age] + totalEventsAbove[age+1]);
+            // eva[c][age] = (hNR[age] - lineGain * expectedLifetime) / eventNR[age];
+            // expectedLifetime += eventR[age];
+            // eva[c][age] += (hR[age] - lineGain * expectedLifetime) / eventR[age];
+            eva[c][age] = (hits - perAccessCost * expectedLifetime) / events;
+            hits += hitCtrs[age][c];
+            events += hitCtrs[age][c] + evictionCtrs[age][c];
+        }
+    }
+    double evaReused = eva[1][1] / (1 - hR[1]);
+    // Differentiate classes
+    for (int c = 0; c < 2; c++) {
+        for (int age = MAX_AGE_VALUE; age > 0; age--) {
+            if (c==0){
+                eva[c][age] += (hNR[age] - h) * evaReused;
+            }
+            else{
+                eva[c][age] += (hR[age] - h) * evaReused;   
             }
         }
     }
 
-    // Calculate hit rates
-    for (int age = 1; age <= MAX_AGE_VALUE; age++) {
-        hR[age] /= eventR[age];
-        hNR[age] /= eventNR[age];
-    }
-
-    // Calculate overall hit rate
-    double h = 0;
-    double events = 0;
-    for (int age = 1; age <= MAX_AGE_VALUE; age++) {
-        h += (hR[age] + hNR[age]);
-        events += (eventR[age] + eventNR[age]);
-    }
-    h /= events;
-
-    double perAccessCost = h * A / N;
-
-    // Compute EVA
-    std::vector<std::vector<double>> eva(2, std::vector<double>(2 * (1 << (k + 1)), 0));
-    double evaReused = eva[1][1] / (1 - hR[1]);
-
-    for (int c = 0; c < 2; c++) {
-        double expectedLifetime = 0;
-        for (int age = 1; age <= MAX_AGE_VALUE; age++) {
-            expectedLifetime += eventNR[age];
-            eva[c][age] = (hNR[age] - perAccessCost * expectedLifetime) / eventNR[age];
-            expectedLifetime += eventR[age];
-            eva[c][age] += (hR[age] - perAccessCost * expectedLifetime) / eventR[age];
-        }
-    }
-
-    // Differentiate classes
-    for (int c = 0; c < 2; c++) {
-        for (int age = 1; age <= MAX_AGE_VALUE; age++) {
-            eva[c][age] += (hR[age] - h) * evaReused;
-        }
-    }
-
     // Finally, rank ages by EVA
-    std::vector<double> evaWithIndex(2 * (1 << (k + 1)));
-    for (int i = 0; i < (2 * (1 << (k + 1))); i++) {
-        evaWithIndex[i] = i;
+    std::vector<std::vector<int>> order(2, std::vector<int>(2 * (1 << (k + 1))));
+    for (int c = 0; c < 2; ++c) {
+        std::iota(order[c].begin(), order[c].end(), 0);
+        std::sort(order[c].begin(), order[c].end(), [&](int a, int b) {
+            return eva[c][a] > eva[c][b];
+        });
     }
-
-    std::sort(evaWithIndex.begin(), evaWithIndex.end(), [&](double a, double b) {
-        return eva[0][a] > eva[0][b];
-    });
-
-    for (int i = 0; i < (2 * (1 << (k + 1))); i++) {
-        rank[evaWithIndex[i]] = (2 * (1 << (k + 1))) - i;
+    
+    for (int c = 0; c < 2; ++c) {
+        for (int i = 0; i < MAX_AGE_VALUE; ++i) {
+            rank[order[c][i]] = MAX_AGE_VALUE - i;
+        }
     }
 
     return rank;
@@ -194,32 +206,31 @@ std::vector<double> computeEVAandUpdateRanks(double hitCtrs[][MAX_AGE_VALUE][2],
 Cache_Age cache_age;
 
 void CACHE::initialize_replacement() { 
-    ::last_used_cycles[this] = std::vector<uint64_t>(NUM_SETS * NUM_WAYS); 
 }
 
 uint32_t CACHE::find_victim(uint32_t triggering_cpu, uint64_t instr_id, uint32_t set, const BLOCK* current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
 {
     // Compute EVA and update ranks
     double N = 8;
-    // double evictionarray[NUM_SETS] = {0};
     std::vector<double> rank = computeEVAandUpdateRanks(hitCtrs_nn, evictionCtrs_nn, AGE_GRANULARITY, N);
-    // std::cout << "Value of set " << set << std::endl; 
-    cache_age.printCacheStatus(set);
-    // std::cout << "Ranking:\n";
-    // for (double i = 0; i <= (2 * (1 << (k + 1)))-1; i++) {
-    //     std::cout << "Age " << i << ": " << rank[i] << std::endl;
-    // }
-    // Find the way with the lowest rank
-    auto minRankIndex = std::min_element(rank.begin(), rank.end());
-    assert(minRankIndex != rank.end()); // Ensure the minimum element exists
+    
+    // Find the way with the maximum rank among all cache lines in the set
+    double maxRank = std::numeric_limits<double>::min();
+    uint32_t victimIndex = 0;
+    for (int way = 0; way < NUM_WAYS; ++way) {
+        auto [ageCounter, classificationBit, timestamp] = cache_age.getCacheLineInfo(set, way);
+        double lineRank = rank[ageCounter];
+        if (lineRank > maxRank) {
+            maxRank = lineRank;
+            victimIndex = way;
+        }
+    }
 
-    // Calculate the index of the victim
-    uint32_t victimIndex = static_cast<uint32_t>(std::distance(rank.begin(), minRankIndex));
-    // Update eviction counters
+    // Update eviction counters for the selected victim
     auto [ageCounter, classificationBit, timestamp] = cache_age.getCacheLineInfo(set, victimIndex);
-    evictionCtrs_nn[set][ageCounter][classificationBit]++;
+    evictionCtrs_nn[ageCounter][classificationBit]++;
     cache_age.accessCache(set, victimIndex, false, true); // Access set 0, way 1, with a hit, evict, call after all calc done
-    std::cout << "Value of victim " << victimIndex << std::endl; 
+    
     return victimIndex;
 }
 
@@ -231,7 +242,7 @@ void CACHE::update_replacement_state(uint32_t triggering_cpu, uint32_t set, uint
   bool hit_age = false; 
   if(hit && access_type{type} != access_type::WRITE){ // If hit and skip for witeback hits
       auto [ageCounter, classificationBit, timestamp] = cache_age.getCacheLineInfo(set, way);
-      hitCtrs_nn[set][ageCounter][classificationBit]++; // increment R
+      hitCtrs_nn[ageCounter][classificationBit]++; // increment R
       hit_age = true;
   }
   cache_age.accessCache(set, way, hit_age, false); // Access set 0, way 1, with a hit, evict, call after all calc done
